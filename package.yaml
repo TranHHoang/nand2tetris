@@ -26,6 +26,8 @@ dependencies:
 - mtl
 - containers
 - directory
+- filepath
+- PyF
 
 ghc-options:
 - -Wall

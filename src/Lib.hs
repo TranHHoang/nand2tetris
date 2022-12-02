@@ -1,7 +1,6 @@
-module Lib
-  ( someFunc,
-  )
-where
+module Lib (someFunc) where
+
+import           HDL.Interpreter (testChip)
 
 someFunc :: IO ()
-someFunc = putStrLn "someFunc"
+someFunc = testChip

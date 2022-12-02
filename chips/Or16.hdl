@@ -1,0 +1,9 @@
+CHIP Or16 {
+    IN a[16], b[16];
+    OUT out[16];
+    PARTS:
+    Not16(in=a, out=notA);
+    Not16(in=b, out=notB);
+    And16(a=notA, b=notB, out=notANotB);
+    Not16(in=notANotB, out=out);
+}
