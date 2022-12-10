@@ -2,31 +2,41 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE BinaryLiterals #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE FlexibleContexts #-}
 
-module HDL.Interpreter (eval, testChip) where
+module HDL.Interpreter () where
 
-import           Control.Monad (forM_)
 import           Control.Monad.Except (ExceptT, MonadError(throwError)
-                                     , MonadIO(liftIO), liftEither, runExceptT)
-import           Control.Monad.State (MonadState(get, put), StateT, execStateT
-                                    , runStateT)
+                                     , MonadIO(liftIO), runExceptT, liftEither)
+import           Control.Monad.State (MonadState(get), StateT, runStateT)
 import           Data.Bits (Bits(shiftL, shiftR, (.|.)), complement, (.&.))
 import           Data.Map (Map)
 import qualified Data.Map as M
 import           Data.Text (Text)
-import           Data.Word (Word16)
-import           HDL.Parser (Chip(..), ChipImpl(..), Conn(..), ConnSide(..)
-                           , Part(..), Pin(..), connSideName, connTargetName
-                           , connValueName, pinName, loadAllChips, loadChip)
+import           HDL.Parser (Chip(..), ChipImpl(..), ConnSide(..), Pin(..)
+                           , connSideName, pinName, Part(partName, partConns)
+                           , Conn(Conn, connValue, connTarget), connTargetName
+                           , connValueName)
 import           Prelude hiding (lookup)
 import           Text.Printf (printf)
 import           PyF (fmt)
+import           Data.Int (Int16)
+import           Data.Maybe (fromMaybe)
+import           Lens.Micro.Platform (makeLenses, use, (%=), view, _2, (^.), (&)
+                                    , ix, at, (.~), (?~), mapped, (^?), preview
+                                    , (.=), (%~), set)
+import           Data.Vector (Vector)
+import qualified Data.Vector as V
+import           Control.Monad (forM_)
+import           Data.Functor ((<&>))
 import           Control.Applicative (Applicative(liftA2))
+import           GHC.Base (returnIO)
 
 type Name = Text
 
-data Value = Bit Word16
-           | Bus Int Word16
+data Value = Bit Int16
+           | Bus Int Int16
 
 instance Show Value where
   show (Bit v) = printf "Bit %b" (0x1 .&. v)
@@ -40,36 +50,42 @@ instance Eq Value where
 type PinTable = Map Name Value
 
 data SymbolTable =
-  SymbolTable { chipTable :: IO (Map Name Chip), pinTable :: PinTable }
+  SymbolTable { _chipTable :: IO (Map Name (Chip, Vector PinTable))
+              , _pinTable :: PinTable
+              , _seqChipCount :: Int
+              }
+
+$(makeLenses ''SymbolTable)
 
 type InterpreterEnv = ExceptT String (StateT SymbolTable IO)
 
-note :: String -> Maybe a -> Either String a
-note e Nothing = Left e
-note _ (Just a) = Right a
+note :: (MonadError String m) => String -> Maybe a -> m a
+note e Nothing = throwError e
+note _ (Just a) = pure a
 
-lookupPinTab :: Name -> PinTable -> Either String Value
-lookupPinTab "true" _ = Right $ Bit 1
-lookupPinTab "false" _ = Right $ Bit 0
+lookupPinTab :: (MonadError String m) => Name -> PinTable -> m Value
+lookupPinTab "true" _ = pure $ Bit 1
+lookupPinTab "false" _ = pure $ Bit 0
 lookupPinTab name pinTab =
   note [fmt|Pin '{name}' not found|] $ M.lookup name pinTab
 
-nBitOne :: Int -> Word16
+nBitOne :: Int -> Int16
 nBitOne n = iterate ((.|. 1) . (`shiftL` 1)) 1 !! n
 
-evalConnSide :: ConnSide -> PinTable -> Either String Value
-evalConnSide side symTab = do
-  v <- lookupPinTab (connSideName side) symTab
+evalConnSide :: (MonadError String m) => ConnSide -> PinTable -> m Value
+evalConnSide side pinTab = do
+  v <- lookupPinTab (connSideName side) pinTab
   case (side, v) of
-    (Id _, _) -> Right v
-    (Index _ idx, Bus bc v') -> if idx < 0 || idx >= bc
-                                then Left [fmt|Index '{idx}' is out of bound|]
-                                else Right $ Bit ((v' `shiftR` idx) .&. 1)
+    (Id _, _) -> pure v
+    (Index _ idx, Bus bc v')
+      -> if idx < 0 || idx >= bc
+         then throwError [fmt|Index '{idx}' is out of bound|]
+         else pure $ Bit ((v' `shiftR` idx) .&. 1)
     (Range _ a b, Bus bc v')
       -> if a < 0 || b <= a || b > bc
-         then Left [fmt|Range '{a}..{b}' is out of bound|]
-         else Right $ Bus (b - a + 1) (v' `shiftR` a .&. nBitOne (b - a))
-    _ -> Left "Invalid operation"
+         then throwError [fmt|Range '{a}..{b}' is out of bound|]
+         else pure $ Bus (b - a + 1) (v' `shiftR` a .&. nBitOne (b - a))
+    _ -> throwError "Invalid operation"
 
 chipPinsToPinTable :: [Pin] -> PinTable -> PinTable
 chipPinsToPinTable pins pinTab = foldr
@@ -81,64 +97,136 @@ chipPinsToPinTable pins pinTab = foldr
   pinTab
   pins
 
-evalImpl :: ChipImpl -> InterpreterEnv ()
-evalImpl (BuiltIn "Nand") = do
-  symTab <- get
-  case (do
-          a <- lookupPinTab "a" (pinTable symTab)
-          b <- lookupPinTab "b" (pinTable symTab)
-          case (a, b) of
-            (Bit x, Bit y) -> Right . Bit $ complement (x .&. y)
-            _ -> Left "Error") of
-    Left err  -> throwError err
-    Right out -> put
-      $ symTab { pinTable = M.insert "out" out (pinTable symTab) }
-evalImpl (BuiltIn _) = undefined
-evalImpl (Parts parts) = do
+tryAdd :: Int -> Vector PinTable -> Vector PinTable
+tryAdd n vec = vec V.++ V.replicate (n - V.length vec) M.empty
+
+-- Return symbol table of the next cycle
+evalImpl :: Chip -> ChipImpl -> InterpreterEnv (Maybe PinTable)
+evalImpl _ (BuiltIn "Nand") = do
+  pinTab <- use pinTable
+  a <- lookupPinTab "a" pinTab
+  b <- lookupPinTab "b" pinTab
+  out <- case (a, b) of
+    (Bit x, Bit y) -> pure . Bit $ complement (x .&. y)
+    _ -> throwError "Invalid operation"
+  pinTable %= M.insert "out" out
+  return Nothing
+evalImpl _ (BuiltIn "DFF") = do
+  symTable <- get
+  seqChipCount %= (+ 1)
+  let seqCount = symTable ^. seqChipCount
+  --
+  maybeDFF <- liftIO $ symTable ^. chipTable <&> view (at "DFF")
+  dff@(_, vecPinTab) <- note "Chip 'DFF' not found" maybeDFF
+  --
+  let vec = tryAdd seqCount vecPinTab
+  -- Get the stored input
+  let currentOut =
+        fromMaybe (Bit 0) $ view (at "out") $ vec ^. ix (seqCount - 1)
+  pinTable %= (at "out" ?~ currentOut)
+  -- Save the next output
+  clockedIn <- lookupPinTab "in" (symTable ^. pinTable)
+  let outPinTab = vec & ix (seqCount - 1) . at "out" ?~ clockedIn
+  chipTable %= fmap (at "DFF" ?~ (dff & _2 .~ outPinTab))
+  return $ Just (outPinTab ^. ix (seqCount - 1))
+  -- where
+     -- Store new value 
+     -- in' <- liftEither $ lookupPinTab "in" (pinTable symTab)
+     -- chip <- liftIO
+     --   (note [fmt|Chip 'DFF' not found|] . M.lookup "DFF" <$> chipTable symTab)
+     --   >>= liftEither
+     -- return $ Just chip { chipIns = [valToPin "in" in'] }
+     -- valToPin name = \case
+     --   Bit v    -> PinSingle name v
+     --   Bus bc v -> PinMulti name bc v
+evalImpl _ (BuiltIn _) = undefined
+evalImpl chip (Parts parts) = do
   forM_ parts
     $ \part -> do
       symTab <- get
       let cname = partName part
-      ceither <- liftIO
-        $ note [fmt|Chip '{cname}' not found|] . M.lookup cname
-        <$> chipTable symTab
-      chip <- liftEither ceither
-      chipLocalSymTab <- liftEither
-        $ supplyInputs chip (partConns part) (pinTable symTab)
-      -- Stub outputs
-      -- let chipLocalSymTab' = foldl
-      --       (\m p -> M.insert
-      --          (pinName p)
-      --          (case p of
-      --             PinSingle _  -> Bit 0
-      --             PinMulti _ n -> Bus n 0)
-      --          m)
-      --       chipLocalSymTab
-      --       (chipOuts chip)
-      chipOutSymTab <- liftIO
-        $ execStateT
-          (runExceptT $ evalImpl (chipImpl chip))
-          symTab { pinTable =
-                     chipPinsToPinTable (chipOuts chip) chipLocalSymTab
-                 }
-      -- _ <- trace
-      --   ("Run "
-      --    <> unpack (chipName chip)
-      --    <> " done. "
-      --    <> show (pinTable chipOutSymTab)
-      --    <> show (pinTable symTab))
-      --   $ pure ()
-      updatedPinTab <- liftEither
-        $ setOutputs
-          chip
-          (partConns part)
-          (pinTable symTab)
-          (pinTable chipOutSymTab)
-      -- _ <- trace (show updatedPinTab) $ pure ()
-      put $ symTab { pinTable = updatedPinTab }
+      maybeChip <- liftIO $ (symTab ^. chipTable) <&> view (at cname)
+      partChip <- fst <$> note [fmt|Chip '{cname}' not found|] maybeChip
+      maybePrevPinTab <- liftIO
+        $ (fmap . fmap) snd (symTab ^. chipTable) <&> view (at $ chipName chip)
+      prevPinTab <- note "Unexpected error" maybePrevPinTab
+        <&> preview (ix $ symTab ^. seqChipCount)
+      chipLocalSymTab <- supplyInputs partChip (partConns part)
+        $ M.union (symTab ^. pinTable) (fromMaybe M.empty prevPinTab)
+      (chipOutNextVal, chipOutSymTab) <- liftIO
+        $ runStateT
+          (runExceptT $ evalImpl partChip (chipImpl partChip))
+          (symTab
+           & pinTable .~ chipPinsToPinTable (chipOuts partChip) chipLocalSymTab)
+      -- Update the state of the container chip
+      updatedPinTab <- setOutputs
+        partChip
+        (partConns part)
+        (symTab ^. pinTable)
+        (chipOutSymTab ^. pinTable)
+      pinTable .= updatedPinTab
+      -- Save the next state
+      chipOutNextVal <- liftEither chipOutNextVal
+      case chipOutNextVal of
+        Nothing -> pure ()
+        Just m  -> do
+          clockedPinTab <- setOutputs partChip (partConns part) M.empty m
+          let seqCount = symTab ^. seqChipCount
+          -- w <- liftIO $ symTab ^. chipTable
+          -- let q = w ^. at (chipName chip) <&> _2 %~ (set (ix $ seqCount - 1) clockedPinTab . tryAdd seqCount)
+          chipTable
+            %= fmap
+              (at (chipName chip)
+               %~ fmap
+                 (_2
+                  %~ (set (ix $ seqCount - 1) clockedPinTab . tryAdd seqCount)))
+  return Nothing
   where
-    setOutputs
-      :: Chip -> [Conn] -> PinTable -> PinTable -> Either String PinTable
+    --       -- Eval the nested chip
+    --       (chipOutEither, chipOutSymTab) <- liftIO
+    --         $ runStateT
+    --           (runExceptT $ evalImpl internalChip (chipImpl internalChip))
+    --           symTab { pinTable =
+    --                      chipPinsToPinTable (chipOuts internalChip) chipLocalSymTab
+    --                  }
+    --       -- Update the state of the container chip
+    --       updatedPinTab <- liftEither
+    --         $ setOutputs
+    --           internalChip
+    --           (partConns part)
+    --           (pinTable symTab)
+    --           (pinTable chipOutSymTab)
+    --       -- _ <- trace (show updatedPinTab) $ pure ()
+    --       put $ symTab { pinTable = updatedPinTab }
+    --       -- Update the array of chips if necessary
+    --       chipOut <- liftEither chipOutEither
+    --       case (oldChip, chipOut) of
+    --         (Nothing, Just c) -> go (chip) ps (seqCount + 1)
+    --         (Just _, Just c) -> go (chip) ps (seqCount + 1)
+    --         _ -> go chip ps seqCount
+    --       -- if isNothing oldChip and then
+    --       --   go (chip { chipChildren = (chipChildren chip) <> [] })
+    --       -- return Nothing
+    --       -- chipOutSymTab <- liftIO
+    --       --   $ execStateT
+    --       --     (runExceptT $ evalImpl (chipImpl chip) Nothing)
+    --       --     symTab { pinTable =
+    --       --                chipPinsToPinTable (chipOuts chip) chipLocalSymTab
+    --       --            }
+    --       -- _ <- trace
+    --       --   ("Run "
+    --       --    <> unpack (chipName chip)
+    --       --    <> " done. "
+    --       --    <> show (pinTable chipOutSymTab)
+    --       --    <> show (pinTable symTab))
+    --       --   $ pure ()
+    --       -- go ps seqCount
+    setOutputs :: (MonadError String m)
+               => Chip
+               -> [Conn]
+               -> PinTable
+               -> PinTable
+               -> m PinTable
     setOutputs chip conns parentSymTab chipSymTab =
       setPins (swapSide <$> outConns) chipSymTab =<< initOutPins
       where
@@ -151,12 +239,13 @@ evalImpl (Parts parts) = do
                               , connValue conn
                               , M.lookup (connTargetName conn) chipSymTab) of
           (Id t, _, _)
-            | t `elem` ["true", "false"] -> Left "Invalid output pin name"
-          (Id _, Id _, Just v) -> Right v
-          (Index _ _, Id _, _) -> Right $ Bit 0
-          (Range _ a b, Id _, _) -> Right $ Bus (b - a + 1) 0
-          (_, _, Just v) -> Right v -- to be discard
-          _ -> Left "Invalid operation"
+            | t
+              `elem` ["true", "false"] -> throwError "Invalid output pin name"
+          (Id _, Id _, Just v) -> pure v
+          (Index _ _, Id _, _) -> pure $ Bit 0
+          (Range _ a b, Id _, _) -> pure $ Bus (b - a + 1) 0
+          (_, _, Just v) -> pure v -- to be discard
+          _ -> throwError "Invalid operation"
 
         initOutPins = foldr
           (\conn -> liftA2 (M.insertWith (const id) (connValueName conn))
@@ -166,7 +255,8 @@ evalImpl (Parts parts) = do
 
         swapSide (Conn target value) = Conn value target
 
-    supplyInputs :: Chip -> [Conn] -> PinTable -> Either String PinTable
+    supplyInputs
+      :: (MonadError String m) => Chip -> [Conn] -> PinTable -> m PinTable
     supplyInputs chip conns parentSymTab = setPins inConns parentSymTab
       $ chipPinsToPinTable (chipIns chip) M.empty
       where
@@ -174,7 +264,8 @@ evalImpl (Parts parts) = do
           filter ((`elem` (pinName <$> chipIns chip)) . connTargetName) conns
 
     -- Set pins for local symbol table using data from parent symbol table
-    setPins :: [Conn] -> PinTable -> PinTable -> Either String PinTable
+    setPins
+      :: (MonadError String m) => [Conn] -> PinTable -> PinTable -> m PinTable
     setPins conns' parentSymTab symTab =
       foldr ((=<<) . updateInVal) (pure symTab) conns'
       where
@@ -200,18 +291,18 @@ evalImpl (Parts parts) = do
           let connRHSName = connValueName conn
           rhs <- case (connTarget conn, target, val) of
             (Id _, x, y) -- a=b
-              | x == y -> Right y
-              | otherwise
-                -> Left [fmt|'{show x}' and '{show y}' is not compatible|]
+              | x == y -> pure y
+              | otherwise -> throwError
+                [fmt|'{show x}' and '{show y}' is not compatible|]
             (Index _ idx, Bus bc bsv, Bit btv) ->
               -- a[1]=b
-              Right $ Bus bc (modifyBits bsv idx 1 btv)
+              pure $ Bus bc (modifyBits bsv idx 1 btv)
             (Range _ a b, Bus bc bsv, Bus bc' bsv')
-              | bc' /= a - b -> Left
+              | bc' /= a - b -> throwError
                 [fmt|Range '{a}..{b}' is larger than the bit count of value|]
-              | otherwise -> Right $ Bus bc (modifyBits bsv a bc' bsv')
+              | otherwise -> pure $ Bus bc (modifyBits bsv a bc' bsv')
             (Range _ a b, Bus bc bsv, Bit _)
-              | connRHSName `elem` ["true", "false"] -> Right
+              | connRHSName `elem` ["true", "false"] -> pure
                 $ Bus
                   bc
                   (modifyBits
@@ -221,34 +312,33 @@ evalImpl (Parts parts) = do
                      (if connRHSName == "true"
                       then nBitOne $ b - a + 1
                       else 0))
-            _ -> Left "Invalid operation"
+            _ -> throwError "Invalid operation"
           return $ M.insert (connTargetName conn) rhs localSymTab
-
-eval :: Chip -> PinTable -> IO ()
-eval chip pinTab = do
-  (s, v) <- runStateT
-    (runExceptT $ evalImpl (chipImpl chip))
-    SymbolTable { chipTable = loadAllChips
-                , pinTable = chipPinsToPinTable (chipOuts chip) pinTab
-                }
-  case s of
-    Left err -> print err
-    Right _  -> print
-      $ filter
-        ((`elem` (pinName <$> chipIns chip <> chipOuts chip)) . fst)
-        (M.toList $ pinTable v)
-
-testChip :: IO ()
-testChip = do
-  chip <- loadChip "ALU"
-  eval
-    chip
-    (M.fromList
-       [ ("x", Bus 16 5)
-       , ("y", Bus 16 10)
-       , ("zx", Bit 1)
-       , ("nx", Bit 1)
-       , ("zy", Bit 1)
-       , ("ny", Bit 1)
-       , ("f", Bit 1)
-       , ("no", Bit 0)])
+-- eval :: Chip -> PinTable -> IO (Maybe Chip)
+-- eval chip pinTab = do
+--   (s, v) <- runStateT
+--     (runExceptT $ evalImpl chip (chipImpl chip))
+--     SymbolTable { chipTable = loadAllChips
+--                 , pinTable = chipPinsToPinTable (chipOuts chip) pinTab
+--                 }
+--   case s of
+--     Left err -> print err >> return Nothing
+--     Right c  -> print
+--       (filter
+--          ((`elem` (pinName <$> chipIns chip <> chipOuts chip)) . fst)
+--          (M.toList $ pinTable v))
+--       >> return c
+-- testChip :: IO ()
+-- testChip = do
+--   chip <- loadChip "ALU"
+--   eval
+--     chip
+--     (M.fromList
+--        [ ("x", Bus 16 5)
+--        , ("y", Bus 16 10)
+--        , ("zx", Bit 1)
+--        , ("nx", Bit 1)
+--        , ("zy", Bit 1)
+--        , ("ny", Bit 1)
+--        , ("f", Bit 1)
+--        , ("no", Bit 0)])

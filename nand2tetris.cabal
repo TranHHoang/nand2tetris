@@ -40,8 +40,10 @@ library
     , directory
     , filepath
     , megaparsec
+    , microlens-platform
     , mtl
     , text
+    , vector
   default-language: Haskell2010
 
 executable nand2tetris-exe
@@ -58,9 +60,11 @@ executable nand2tetris-exe
     , directory
     , filepath
     , megaparsec
+    , microlens-platform
     , mtl
     , nand2tetris
     , text
+    , vector
   default-language: Haskell2010
 
 test-suite nand2tetris-test
@@ -78,7 +82,9 @@ test-suite nand2tetris-test
     , directory
     , filepath
     , megaparsec
+    , microlens-platform
     , mtl
     , nand2tetris
     , text
+    , vector
   default-language: Haskell2010

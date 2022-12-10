@@ -28,6 +28,8 @@ dependencies:
 - directory
 - filepath
 - PyF
+- microlens-platform
+- vector
 
 ghc-options:
 - -Wall
